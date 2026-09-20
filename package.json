@@ -1,0 +1,21 @@
+{
+  "name": "vidya_education_by_rahul_sir",
+  "version": "0.0.1",
+  "description": "Edtech Application",
+  "main": "./main.js",
+  "author": "Windows <info@applytiz.com>",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.2.1",
+    "ejs-electron": "^2.1.1",
+    "electron-json-storage-sync": "^1.2.0",
+    "electron-updater": "^5.3.0",
+    "ffmpeg-static": "^5.3.0",
+    "form-data": "^4.0.0",
+    "jwt-decode": "^3.1.2",
+    "keytar": "^7.9.0",
+    "node-machine-id": "^1.1.12",
+    "shell": "^0.5.1",
+    "systeminformation": "^5.18.5"
+  }
+}
