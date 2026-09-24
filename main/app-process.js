@@ -5,7 +5,8 @@ const { BrowserWindow, app, ipcMain, dialog, session, net } = require("electron"
 const path = require("path");
 const fs = require('fs');
 const { spawn } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
+const rawFfmpegPath = require('ffmpeg-static');
+const ffmpegPath = rawFfmpegPath ? rawFfmpegPath.replace('app.asar', 'app.asar.unpacked') : null;
 
 const envVariables = require('../env-variables');
 
@@ -13,11 +14,9 @@ const window_setting = {
 //    titleBarStyle: 'hidden',
     show: false,
     autoHideMenuBar: true,
-    frame: false,
-//    kiosk: true,
-//    resizable: false,
-    title: "Login Page",
-    icon: path.join(__dirname, '../assets/images/app_icon.png'),
+    frame: true, // Standard window frame with Minimize, Maximize, and Close (X) buttons
+    title: "Vidya Education",
+    icon: path.join(__dirname, '../images/app_icon.ico'),
     webPreferences: {
         devTools: envVariables.isDev === 1 ? true : false,
         contextIsolation: true,
@@ -34,6 +33,8 @@ let capturedVideoUrls = [];
 let latestPlaylistUrl = null;
 let lastMediaHeaders = {};
 let isDownloading = false;
+let cancelDownloadRequested = false;
+let activeFFmpegProcess = null;
 
 async function createAppWindow() {
     console.log(path.join(__dirname, "preload/preload.js"));
@@ -89,6 +90,20 @@ async function createAppWindow() {
         };
     });
 
+    // --- 3b. IPC: Cancel active video download ---
+    ipcMain.handle('cancel-download', () => {
+        if (!isDownloading) return { success: false, message: 'No download in progress' };
+        console.log('[Video Download] Cancel requested by user.');
+        cancelDownloadRequested = true;
+        if (activeFFmpegProcess) {
+            try {
+                activeFFmpegProcess.kill('SIGKILL');
+            } catch (e) {}
+            activeFFmpegProcess = null;
+        }
+        return { success: true };
+    });
+
     // --- 4. Helper: fetch URL using Electron's net with authentication headers ---
     function netFetch(url, customHeaders = {}) {
         return new Promise((resolve, reject) => {
@@ -135,12 +150,16 @@ async function createAppWindow() {
         }
     }
 
-    // --- 6. Helper: Send completion to renderer ---
-    function sendComplete(success, detail) {
+    // --- 6. Helper: Send completion or cancellation to renderer ---
+    function sendComplete(success, detail, isCancelled = false) {
         isDownloading = false;
+        cancelDownloadRequested = false;
+        activeFFmpegProcess = null;
         if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.setProgressBar(-1);
-            if (success) {
+            if (isCancelled) {
+                mainWindow.webContents.send('download-complete', { success: false, cancelled: true, message: detail || 'Download cancelled' });
+            } else if (success) {
                 mainWindow.webContents.send('download-complete', { success: true, path: detail });
             } else {
                 mainWindow.webContents.send('download-complete', { success: false, error: detail });
@@ -148,22 +167,24 @@ async function createAppWindow() {
         }
     }
 
-    // --- 7. Download all segments concurrently ---
+    // --- 7. Download all segments concurrently with real-time ETA ---
     async function downloadAllSegments(segments, tempDir) {
         let completed = 0;
         let failed = 0;
         const total = segments.length;
         const concurrency = 6;
         let nextIndex = 0;
+        const downloadStartTime = Date.now();
 
         async function worker() {
-            while (nextIndex < total) {
+            while (nextIndex < total && !cancelDownloadRequested) {
                 const i = nextIndex++;
                 const segUrl = segments[i];
                 const segPath = path.join(tempDir, 'seg_' + String(i).padStart(5, '0') + '.ts');
 
                 let success = false;
                 for (let attempt = 0; attempt < 3; attempt++) {
+                    if (cancelDownloadRequested) break;
                     try {
                         const data = await netFetch(segUrl);
                         if (data && data.length > 0) {
@@ -176,6 +197,8 @@ async function createAppWindow() {
                     }
                 }
 
+                if (cancelDownloadRequested) break;
+
                 if (success) {
                     completed++;
                 } else {
@@ -184,11 +207,27 @@ async function createAppWindow() {
                 }
 
                 const currentDone = completed + failed;
-                const percent = Math.round((currentDone / total) * 88);
-                sendProgress(percent, `Downloading: ${currentDone}/${total} segments (${Math.round((currentDone / total) * 100)}%)`);
+                const elapsedSec = (Date.now() - downloadStartTime) / 1000;
+                let etaStr = '';
+                if (elapsedSec > 1.5 && currentDone > 3) {
+                    const segPerSec = currentDone / elapsedSec;
+                    const remSec = Math.ceil((total - currentDone) / segPerSec);
+                    if (remSec < 60) {
+                        etaStr = ` • ~${remSec}s left`;
+                    } else {
+                        const m = Math.floor(remSec / 60);
+                        const s = remSec % 60;
+                        etaStr = ` • ~${m}m ${s}s left`;
+                    }
+                }
 
-                if (currentDone % 20 === 0 || currentDone === total) {
-                    console.log(`[HLS Downloader] Progress: ${currentDone}/${total} (${percent}%)`);
+                // Download phase covers 5% to 80%
+                const overallPercent = Math.min(80, Math.round(5 + ((currentDone / total) * 75)));
+                const dlPercent = Math.round((currentDone / total) * 100);
+                sendProgress(overallPercent, `Downloading: ${currentDone}/${total} segments (${dlPercent}%)${etaStr}`);
+
+                if (currentDone % 25 === 0 || currentDone === total) {
+                    console.log(`[HLS Downloader] Progress: ${currentDone}/${total} (${dlPercent}%)${etaStr}`);
                 }
             }
         }
@@ -198,33 +237,144 @@ async function createAppWindow() {
             workers.push(worker());
         }
         await Promise.all(workers);
+
+        if (cancelDownloadRequested) {
+            throw new Error('DOWNLOAD_CANCELLED');
+        }
+
         return { completed, failed, total };
     }
 
-    // --- 8. Remux downloaded segments using FFmpeg into a clean MP4 ---
-    function remuxWithFFmpeg(tempDir, segmentCount, savePath) {
+    // --- Helper: Run an FFmpeg pass with live speed and ETA reporting ---
+    function runFFmpegPass(args, totalDurationSeconds, statusPrefix, savePath) {
         return new Promise((resolve, reject) => {
-            sendProgress(92, 'Finalizing video (remuxing to clean MP4 with FFmpeg)...');
-            console.log('[FFmpeg] Preparing concat list...');
+            if (cancelDownloadRequested) {
+                return reject(new Error('DOWNLOAD_CANCELLED'));
+            }
 
-            const concatFile = path.join(tempDir, 'concat.txt');
-            const fileLines = [];
-            for (let i = 0; i < segmentCount; i++) {
-                const segFile = path.join(tempDir, 'seg_' + String(i).padStart(5, '0') + '.ts').replace(/\\/g, '/');
-                if (fs.existsSync(segFile) && fs.statSync(segFile).size > 0) {
-                    fileLines.push(`file '${segFile}'`);
+            const ff = spawn(ffmpegPath, args);
+            activeFFmpegProcess = ff;
+            let stderr = '';
+            let buffer = '';
+            let lastUpdate = 0;
+            const startTime = Date.now();
+
+            ff.stdout.on('data', chunk => {
+                buffer += chunk.toString();
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // keep last incomplete line
+
+                let outTimeUs = null;
+                let speedStr = null;
+
+                for (const l of lines) {
+                    const parts = l.trim().split('=');
+                    if (parts[0] === 'out_time_us') outTimeUs = parseInt(parts[1]);
+                    if (parts[0] === 'speed') speedStr = parts[1] ? parts[1].trim() : null;
                 }
+
+                if (outTimeUs !== null && !isNaN(outTimeUs) && totalDurationSeconds > 0) {
+                    const now = Date.now();
+                    if (now - lastUpdate > 300) { // update ~3 times per second
+                        lastUpdate = now;
+                        const processedSec = outTimeUs / 1000000;
+                        const fraction = Math.min(0.99, Math.max(0, processedSec / totalDurationSeconds));
+                        const overallPercent = Math.min(98, Math.round(80 + (fraction * 18)));
+                        const remuxPct = Math.round(fraction * 100);
+
+                        let speed = speedStr ? parseFloat(speedStr) : 0;
+                        if (!speed || isNaN(speed) || speed <= 0) {
+                            const elapsed = (now - startTime) / 1000;
+                            if (elapsed > 0.4 && processedSec > 0) speed = processedSec / elapsed;
+                        }
+
+                        let etaStr = '';
+                        if (speed > 0) {
+                            const remainingSec = Math.max(0, totalDurationSeconds - processedSec);
+                            const etaSec = Math.ceil(remainingSec / speed);
+                            if (etaSec < 60) {
+                                etaStr = ` • ~${etaSec}s left`;
+                            } else {
+                                const m = Math.floor(etaSec / 60);
+                                const s = etaSec % 60;
+                                etaStr = ` • ~${m}m ${s}s left`;
+                            }
+                        }
+
+                        const speedDisplay = speed > 0 ? ` (${speed.toFixed(0)}x speed)` : '';
+                        const msg = `${statusPrefix}: ${remuxPct}%${etaStr}${speedDisplay}`;
+                        sendProgress(overallPercent, msg);
+                    }
+                }
+            });
+
+            ff.stderr.on('data', d => {
+                stderr += d.toString();
+            });
+
+            ff.on('error', err => {
+                reject(err);
+            });
+
+            ff.on('close', code => {
+                activeFFmpegProcess = null;
+                if (cancelDownloadRequested) {
+                    return reject(new Error('DOWNLOAD_CANCELLED'));
+                }
+                if (code === 0 && fs.existsSync(savePath) && fs.statSync(savePath).size > 0) {
+                    resolve(savePath);
+                } else {
+                    reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-300)}`));
+                }
+            });
+        });
+    }
+
+    // --- 8. Remux downloaded segments with Ultra-Fast Stream Copy (~3-6 seconds) ---
+    async function remuxWithFFmpeg(tempDir, segmentCount, savePath, totalDurationSeconds) {
+        sendProgress(80, 'Finalizing video (fast stream copy)...');
+        console.log('[FFmpeg] Preparing concat list...');
+
+        const concatFile = path.join(tempDir, 'concat.txt');
+        const fileLines = [];
+        for (let i = 0; i < segmentCount; i++) {
+            const segFile = path.join(tempDir, 'seg_' + String(i).padStart(5, '0') + '.ts').replace(/\\/g, '/');
+            if (fs.existsSync(segFile) && fs.statSync(segFile).size > 0) {
+                fileLines.push(`file '${segFile}'`);
             }
+        }
 
-            if (fileLines.length === 0) {
-                return reject(new Error('No valid segments to remux'));
-            }
+        if (fileLines.length === 0) {
+            throw new Error('No valid segments to remux');
+        }
 
-            fs.writeFileSync(concatFile, fileLines.join('\n'));
-            console.log(`[FFmpeg] Concat list ready with ${fileLines.length} segments. Running ffmpeg...`);
+        fs.writeFileSync(concatFile, fileLines.join('\n'));
+        console.log(`[FFmpeg] Concat list ready with ${fileLines.length} segments.`);
 
-            // Output clean MP4: copy video stream losslessly, clean audio re-encode to AAC
-            const args = [
+        // Strategy 1: Ultra-Fast Stream Copy (instant, 0% CPU re-encode, ~3-6 seconds)
+        const fastArgs = [
+            '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', concatFile,
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-avoid_negative_ts', 'make_zero',
+            '-fflags', '+genpts+discardcorrupt',
+            '-progress', 'pipe:1',
+            savePath
+        ];
+
+        try {
+            console.log('[FFmpeg] Running Strategy 1: Ultra-Fast Copy Remux...');
+            await runFFmpegPass(fastArgs, totalDurationSeconds, 'Finalizing MP4', savePath);
+            console.log('[FFmpeg] ✅ Ultra-Fast remux successful! File size:', fs.statSync(savePath).size, 'bytes');
+            return savePath;
+        } catch (fastErr) {
+            console.warn('[FFmpeg] Strategy 1 failed, falling back to safe re-encode:', fastErr.message);
+
+            // Strategy 2: Safe Re-encode Fallback (guaranteed compatibility for unusual audio codecs)
+            const fallbackArgs = [
                 '-y',
                 '-f', 'concat',
                 '-safe', '0',
@@ -233,32 +383,12 @@ async function createAppWindow() {
                 '-c:a', 'aac',
                 '-b:a', '192k',
                 '-ar', '44100',
-                '-movflags', '+faststart',
+                '-progress', 'pipe:1',
                 savePath
             ];
-
-            const ff = spawn(ffmpegPath, args);
-            let stderr = '';
-
-            ff.stderr.on('data', d => {
-                stderr += d.toString();
-            });
-
-            ff.on('error', err => {
-                console.error('[FFmpeg] Failed to spawn:', err);
-                reject(err);
-            });
-
-            ff.on('close', code => {
-                if (code === 0 && fs.existsSync(savePath) && fs.statSync(savePath).size > 0) {
-                    console.log('[FFmpeg] ✅ Remux successful! File size:', fs.statSync(savePath).size, 'bytes');
-                    resolve(savePath);
-                } else {
-                    console.error('[FFmpeg] Remux failed with code:', code, stderr.slice(-400));
-                    reject(new Error(`FFmpeg remuxing failed with code ${code}`));
-                }
-            });
-        });
+            await runFFmpegPass(fallbackArgs, totalDurationSeconds, 'Finalizing MP4 (Safe Mode)', savePath);
+            return savePath;
+        }
     }
 
     // --- 9. HLS Stream Downloader Pipeline ---
@@ -311,11 +441,16 @@ async function createAppWindow() {
                 }
             }
 
-            // Step 2: Parse segment URLs
+            // Step 2: Parse segment URLs and total video duration
             const tokenQuery = playlistUrl.includes('?') ? playlistUrl.substring(playlistUrl.indexOf('?')) : '';
             const segments = [];
+            let totalDurationSeconds = 0;
 
             for (const line of lines) {
+                if (line.startsWith('#EXTINF:')) {
+                    const m = line.match(/#EXTINF:([\d.]+)/);
+                    if (m) totalDurationSeconds += parseFloat(m[1]);
+                }
                 if (!line.startsWith('#')) {
                     let segUrl = line.startsWith('http') ? line : baseUrl + line;
                     // Append edge-cache-token query string if not present
@@ -326,7 +461,11 @@ async function createAppWindow() {
                 }
             }
 
-            console.log(`[HLS Downloader] Total segments in playlist: ${segments.length}`);
+            if (totalDurationSeconds === 0) {
+                totalDurationSeconds = segments.length * 10; // estimate ~10s per segment if not in headers
+            }
+
+            console.log(`[HLS Downloader] Total segments in playlist: ${segments.length}, estimated duration: ${Math.round(totalDurationSeconds)}s`);
 
             if (segments.length === 0) {
                 throw new Error('No video segments found in the playlist');
@@ -340,8 +479,8 @@ async function createAppWindow() {
                 throw new Error('Failed to download video segments');
             }
 
-            // Step 4: Remux all segments into clean MP4 with FFmpeg
-            await remuxWithFFmpeg(tempDir, segments.length, savePath);
+            // Step 4: Remux all segments into clean MP4 with live progress & ETA
+            await remuxWithFFmpeg(tempDir, segments.length, savePath, totalDurationSeconds);
 
             // Step 5: Clean up temp directory
             try {
@@ -352,12 +491,23 @@ async function createAppWindow() {
             sendComplete(true, savePath);
 
         } catch (error) {
-            console.error('[HLS Downloader] Error:', error.message);
-            // Clean up temp directory on error
+            console.error('[HLS Downloader] Status/Error:', error.message);
+            // Clean up temp directory on error or cancel
             try {
                 fs.rmSync(tempDir, { recursive: true, force: true });
             } catch (e) {}
-            sendComplete(false, error.message);
+
+            // Remove partial output file if cancelled
+            if ((cancelDownloadRequested || error.message === 'DOWNLOAD_CANCELLED') && fs.existsSync(savePath)) {
+                try { fs.unlinkSync(savePath); } catch (e) {}
+            }
+
+            if (cancelDownloadRequested || error.message === 'DOWNLOAD_CANCELLED') {
+                console.log('[HLS Downloader] Download cancelled by user, cleaned up.');
+                sendComplete(false, 'Download cancelled by user', true);
+            } else {
+                sendComplete(false, error.message);
+            }
         }
     }
 
@@ -377,7 +527,7 @@ async function createAppWindow() {
     // --- 11. IPC: Trigger a video download ---
     ipcMain.handle('download-video', async (event, url) => {
         if (isDownloading) {
-            return { success: false, error: 'A download is already in progress. Please wait.' };
+            return { success: false, error: 'A download is already in progress. Please wait or cancel it.' };
         }
 
         // Determine target URL (prefer latest playlist if available)
@@ -423,6 +573,8 @@ async function createAppWindow() {
         }
 
         isDownloading = true;
+        cancelDownloadRequested = false;
+        activeFFmpegProcess = null;
 
         const isHLS = /\.m3u8(\?|#|$)/i.test(targetUrl) || (latestPlaylistUrl && targetUrl === latestPlaylistUrl);
 
@@ -443,6 +595,16 @@ async function createAppWindow() {
         lastFocusedWindow = mainWindow;
     });
 
+    mainWindow.on('close', function () {
+        cancelDownloadRequested = true;
+        if (activeFFmpegProcess) {
+            try {
+                activeFFmpegProcess.kill('SIGKILL');
+            } catch (e) {}
+            activeFFmpegProcess = null;
+        }
+    });
+
     mainWindow.on('closed', function () {
         mainWindow = null;
 
@@ -451,6 +613,17 @@ async function createAppWindow() {
         }
     });
 }
+
+// Ensure clean termination on quit
+app.on('before-quit', () => {
+    cancelDownloadRequested = true;
+    if (activeFFmpegProcess) {
+        try {
+            activeFFmpegProcess.kill('SIGKILL');
+        } catch (e) {}
+        activeFFmpegProcess = null;
+    }
+});
 
 // Ensure only a single instance runs
 const gotTheLock = app.requestSingleInstanceLock();

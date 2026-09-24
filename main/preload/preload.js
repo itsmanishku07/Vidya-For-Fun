@@ -133,24 +133,75 @@ function initDownloadFeature() {
             background: rgba(20, 20, 20, 0.96) !important;
             color: #fff !important;
             border-radius: 14px !important;
-            padding: 18px 26px !important;
+            padding: 16px 22px !important;
             font-size: 15px !important;
             font-family: Arial, sans-serif !important;
             box-shadow: 0 8px 32px rgba(0,0,0,0.6) !important;
             transform: translateY(120px) !important;
             opacity: 0 !important;
             transition: transform 0.4s ease, opacity 0.4s ease !important;
-            max-width: 380px !important;
-            border: 1px solid rgba(255,255,255,0.15) !important;
-            pointer-events: none !important;
+            min-width: 320px !important;
+            max-width: 440px !important;
+            border: 1px solid rgba(255,255,255,0.18) !important;
+            pointer-events: auto !important;
+            user-select: none !important;
         }
         #vdl-toast.show {
             transform: translateY(0) !important;
             opacity: 1 !important;
         }
-        #vdl-toast .t-title { font-weight: bold; margin-bottom: 6px; font-size: 16px; }
-        #vdl-toast .t-progress { width:100%; height:6px; background:rgba(255,255,255,0.15); border-radius:3px; margin-top:10px; overflow:hidden; }
-        #vdl-toast .t-bar { height:100%; background:linear-gradient(90deg,#00E676,#69F0AE); border-radius:3px; transition:width 0.3s; width:0%; }
+        #vdl-toast .t-header {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: space-between !important;
+            margin-bottom: 8px !important;
+            gap: 12px !important;
+        }
+        #vdl-toast .t-title {
+            font-weight: bold !important;
+            font-size: 15px !important;
+            flex-grow: 1 !important;
+        }
+        #vdl-toast .t-cancel-btn {
+            background: #e53935 !important;
+            color: #fff !important;
+            border: 1px solid rgba(255,255,255,0.3) !important;
+            border-radius: 6px !important;
+            padding: 4px 12px !important;
+            font-size: 12px !important;
+            font-weight: bold !important;
+            cursor: pointer !important;
+            transition: background 0.2s, transform 0.1s !important;
+            white-space: nowrap !important;
+            pointer-events: auto !important;
+        }
+        #vdl-toast .t-cancel-btn:hover {
+            background: #b71c1c !important;
+            transform: scale(1.05) !important;
+        }
+        #vdl-toast .t-cancel-btn:active {
+            transform: scale(0.95) !important;
+        }
+        #vdl-toast .t-msg {
+            font-size: 13px !important;
+            color: rgba(255,255,255,0.85) !important;
+            line-height: 1.4 !important;
+        }
+        #vdl-toast .t-progress {
+            width: 100% !important;
+            height: 6px !important;
+            background: rgba(255,255,255,0.15) !important;
+            border-radius: 3px !important;
+            margin-top: 10px !important;
+            overflow: hidden !important;
+        }
+        #vdl-toast .t-bar {
+            height: 100% !important;
+            background: linear-gradient(90deg, #00E676, #69F0AE) !important;
+            border-radius: 3px !important;
+            transition: width 0.3s !important;
+            width: 0% !important;
+        }
 
         #vdl-hint {
             position: fixed !important;
@@ -167,16 +218,42 @@ function initDownloadFeature() {
     (document.head || document.documentElement).appendChild(style);
 
     // --- Toast functions ---
-    function showToast(title, message, showProgress) {
+    function showToast(title, message, showProgress, showCancel = false) {
         let t = document.getElementById('vdl-toast');
         if (t) t.remove();
         t = document.createElement('div');
         t.id = 'vdl-toast';
-        t.innerHTML = '<div class="t-title">' + title + '</div><div class="t-msg">' + message + '</div>' +
+
+        let headerHtml = `<div class="t-header"><div class="t-title">${title}</div>`;
+        if (showCancel) {
+            headerHtml += `<button class="t-cancel-btn" id="vdl-cancel-btn" title="Cancel Download (or press Esc)">✕ Cancel</button>`;
+        }
+        headerHtml += `</div>`;
+
+        t.innerHTML = headerHtml + '<div class="t-msg">' + message + '</div>' +
             (showProgress ? '<div class="t-progress"><div class="t-bar"></div></div>' : '');
         document.body.appendChild(t);
+
+        if (showCancel) {
+            const cancelBtn = t.querySelector('#vdl-cancel-btn');
+            if (cancelBtn) {
+                cancelBtn.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    cancelBtn.disabled = true;
+                    cancelBtn.textContent = 'Cancelling...';
+                    try {
+                        await ipcRenderer.invoke('cancel-download');
+                    } catch (err) {
+                        console.error('[VDL] Cancel error:', err);
+                    }
+                });
+            }
+        }
+
         requestAnimationFrame(() => requestAnimationFrame(() => t.classList.add('show')));
     }
+
     function updateToastProgress(percent) {
         const t = document.getElementById('vdl-toast');
         if (!t) return;
@@ -185,10 +262,14 @@ function initDownloadFeature() {
         if (bar) bar.style.width = percent + '%';
         if (msg) msg.textContent = 'Downloading... ' + percent + '%';
     }
+
     function hideToast(delay) {
         setTimeout(() => {
             const t = document.getElementById('vdl-toast');
-            if (t) { t.classList.remove('show'); setTimeout(() => { const t2 = document.getElementById('vdl-toast'); if (t2) t2.remove(); }, 500); }
+            if (t) {
+                t.classList.remove('show');
+                setTimeout(() => { const t2 = document.getElementById('vdl-toast'); if (t2) t2.remove(); }, 500);
+            }
         }, delay || 0);
     }
 
@@ -197,24 +278,43 @@ function initDownloadFeature() {
         updateToastProgress(data.percent);
         if (data.message) {
             const t = document.getElementById('vdl-toast');
-            if (t) { const msg = t.querySelector('.t-msg'); if (msg) msg.textContent = data.message; }
+            if (t) {
+                const msg = t.querySelector('.t-msg');
+                if (msg) msg.textContent = data.message;
+            }
         }
     });
+
     ipcRenderer.on('download-complete', (ev, data) => {
-        if (data.success) {
-            showToast('✅ Download Complete!', 'Saved to: ' + data.path, false);
+        if (data.cancelled) {
+            showToast('⚠️ Download Cancelled', data.message || 'Download was cancelled by user.', false, false);
+        } else if (data.success) {
+            showToast('✅ Download Complete!', 'Saved to: ' + data.path, false, false);
         } else {
-            showToast('❌ Download Failed', 'Error: ' + data.error, false);
+            showToast('❌ Download Failed', 'Error: ' + (data.error || 'Unknown error'), false, false);
         }
         hideToast(5000);
         const btn = document.getElementById('vdl-float-btn');
-        if (btn) { btn.classList.remove('downloading'); const t = btn.querySelector('.vdl-btn-text'); if (t) t.textContent = 'DOWNLOAD VIDEO'; }
+        if (btn) {
+            btn.classList.remove('downloading');
+            const t = btn.querySelector('.vdl-btn-text');
+            if (t) t.textContent = 'DOWNLOAD VIDEO';
+        }
     });
 
     // --- Main download logic ---
     async function triggerDownload() {
         const btn = document.getElementById('vdl-float-btn');
-        if (btn && btn.classList.contains('downloading')) return;
+        if (btn && btn.classList.contains('downloading')) {
+            // If already downloading, clicking the button or pressing Escape cancels it
+            const cancelBtn = document.getElementById('vdl-cancel-btn');
+            if (cancelBtn) {
+                cancelBtn.click();
+            } else {
+                ipcRenderer.invoke('cancel-download');
+            }
+            return;
+        }
 
         let videoUrl = '';
 
@@ -254,30 +354,42 @@ function initDownloadFeature() {
         }
 
         if (!videoUrl) {
-            showToast('⚠️ No Video Found', 'Play a video first, then click this button to download it.', false);
+            showToast('⚠️ No Video Found', 'Play a video first, then click this button to download it.', false, false);
             hideToast(5000);
             return;
         }
 
         console.log('[VDL] Downloading:', videoUrl);
 
-        if (btn) { btn.classList.add('downloading'); const t = btn.querySelector('.vdl-btn-text'); if (t) t.textContent = 'DOWNLOADING...'; }
-        showToast('⬇️ Downloading Video', 'Opening save dialog...', true);
+        if (btn) {
+            btn.classList.add('downloading');
+            const t = btn.querySelector('.vdl-btn-text');
+            if (t) t.textContent = 'DOWNLOADING... (CLICK TO CANCEL)';
+        }
+        showToast('⬇️ Downloading Video', 'Opening save dialog...', true, true);
 
         try {
             const result = await ipcRenderer.invoke('download-video', videoUrl);
             if (!result.success) {
-                if (btn) { btn.classList.remove('downloading'); const t = btn.querySelector('.vdl-btn-text'); if (t) t.textContent = 'DOWNLOAD VIDEO'; }
+                if (btn) {
+                    btn.classList.remove('downloading');
+                    const t = btn.querySelector('.vdl-btn-text');
+                    if (t) t.textContent = 'DOWNLOAD VIDEO';
+                }
                 if (result.error !== 'Cancelled') {
-                    showToast('❌ Download Failed', result.error || 'Unknown error', false);
+                    showToast('❌ Download Failed', result.error || 'Unknown error', false, false);
                     hideToast(3000);
                 } else {
                     hideToast(0);
                 }
             }
         } catch (err) {
-            if (btn) { btn.classList.remove('downloading'); const t = btn.querySelector('.vdl-btn-text'); if (t) t.textContent = 'DOWNLOAD VIDEO'; }
-            showToast('❌ Error', err.message, false);
+            if (btn) {
+                btn.classList.remove('downloading');
+                const t = btn.querySelector('.vdl-btn-text');
+                if (t) t.textContent = 'DOWNLOAD VIDEO';
+            }
+            showToast('❌ Error', err.message, false, false);
             hideToast(3000);
         }
     }
@@ -301,11 +413,21 @@ function initDownloadFeature() {
         console.log('[VDL] ✅ Download button injected into page');
     }
 
-    // --- Ctrl+D keyboard shortcut ---
+    // --- Keyboard shortcuts (Ctrl+D to download, Escape to cancel) ---
     document.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && e.key === 'd') {
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'd' || e.key === 'D')) {
             e.preventDefault();
             triggerDownload();
+        } else if (e.key === 'Escape') {
+            const btn = document.getElementById('vdl-float-btn');
+            if (btn && btn.classList.contains('downloading')) {
+                const cancelBtn = document.getElementById('vdl-cancel-btn');
+                if (cancelBtn) {
+                    cancelBtn.click();
+                } else {
+                    ipcRenderer.invoke('cancel-download');
+                }
+            }
         }
     });
 
@@ -314,7 +436,7 @@ function initDownloadFeature() {
     setInterval(ensureButton, 1500);
     window.addEventListener('load', ensureButton);
 
-    console.log('[VDL] ✅ Video Download feature ready. Button is ALWAYS visible. Shortcut: Ctrl+D');
+    console.log('[VDL] ✅ Video Download feature ready. Button is ALWAYS visible. Shortcut: Ctrl+D, Cancel: Esc');
 }
 
 // Initialize as soon as possible
